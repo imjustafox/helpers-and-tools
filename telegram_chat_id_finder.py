@@ -1,9 +1,12 @@
+import os
 import requests
 import time
 import sys
 
 
-BOT_TOKEN = "InsertYourBotTokenFromBotFatherHere"
+# Set via environment so the token never ends up in the repo:
+#   TELEGRAM_BOT_TOKEN=123:abc python3 telegram_chat_id_finder.py
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "InsertYourBotTokenFromBotFatherHere")
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # Store bot info for mention detection
@@ -33,6 +36,49 @@ def check_connection():
         print("Failed to connect to Telegram API")
         print(e)
         return False
+
+
+# --- Webhook handling ---
+# getUpdates is rejected (409) while a webhook is set. With --swap-webhook the
+# webhook is removed for the session and restored on exit (incl. Ctrl+C).
+def get_webhook_info():
+    r = requests.get(f"{BASE_URL}/getWebhookInfo", timeout=5)
+    r.raise_for_status()
+    return r.json().get("result", {})
+
+
+def remove_webhook():
+    # Keep pending updates so they're not silently dropped
+    r = requests.post(f"{BASE_URL}/deleteWebhook", json={"drop_pending_updates": False}, timeout=10)
+    data = r.json()
+    if not data.get("ok"):
+        print(f"❌ deleteWebhook failed: {data.get('description')}")
+        return False
+    print("Webhook removed for this session.")
+    return True
+
+
+def restore_webhook(info):
+    # getWebhookInfo never returns the secret_token, so it must be supplied again
+    params = {"url": info["url"]}
+    for key in ("max_connections", "allowed_updates", "ip_address"):
+        if info.get(key) is not None:
+            params[key] = info[key]
+    secret = os.environ.get("TELEGRAM_WEBHOOK_SECRET")
+    if secret:
+        params["secret_token"] = secret
+
+    try:
+        r = requests.post(f"{BASE_URL}/setWebhook", json=params, timeout=10)
+        data = r.json()
+    except requests.exceptions.RequestException as e:
+        data = {"ok": False, "description": str(e)}
+
+    if data.get("ok"):
+        print(f"✅ Webhook restored: {info['url']}")
+    else:
+        print(f"❌ Failed to restore webhook: {data.get('description')}")
+        print(f"   Restore it manually with setWebhook, url={info['url']}")
 
 
 def is_bot_mentioned_or_command(msg, debug=False):
@@ -114,6 +160,27 @@ if not check_connection():
 offset = 0
 seen_locations = {}  # Key: (chat_id, topic_id or None)
 DEBUG = "--debug" in sys.argv  # Enable debug mode with --debug flag
+SWAP_WEBHOOK = "--swap-webhook" in sys.argv  # Temporarily remove webhook, restore on exit
+
+try:
+    webhook_info = get_webhook_info()
+except requests.exceptions.RequestException as e:
+    print("Failed to fetch webhook info")
+    print(e)
+    sys.exit(1)
+
+saved_webhook = None  # Set once removed, so we only restore what we deleted
+if webhook_info.get("url"):
+    if not SWAP_WEBHOOK:
+        print(f"❌ Bot has a webhook set ({webhook_info['url']}), so getUpdates won't work.")
+        print("   Re-run with --swap-webhook to remove it temporarily and restore it on Ctrl+C.")
+        sys.exit(1)
+    if not os.environ.get("TELEGRAM_WEBHOOK_SECRET"):
+        print("⚠️  TELEGRAM_WEBHOOK_SECRET not set. If the webhook uses a secret token,")
+        print("   it will be restored WITHOUT it (Telegram can't report the original).")
+    if not remove_webhook():
+        sys.exit(1)
+    saved_webhook = webhook_info
 
 print("Listening for mentions and commands (Ctrl+C to stop)...\n")
 print("The bot will only show chats/topics where it's mentioned or receives commands")
@@ -132,6 +199,10 @@ try:
             },
             timeout=35
         ).json()
+
+        if not r.get("ok"):
+            print(f"❌ getUpdates failed: {r.get('error_code')} {r.get('description')}")
+            break
 
         for update in r.get("result", []):
             offset = update["update_id"] + 1
@@ -197,6 +268,10 @@ except KeyboardInterrupt:
     print("\nStopped by user (Ctrl+C)")
 
 finally:
+    if saved_webhook:
+        print()
+        restore_webhook(saved_webhook)
+
     print("\nLocations where bot was mentioned or received commands:\n")
     if not seen_locations:
         print("No mentions or commands captured.")
